@@ -90,6 +90,22 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
+import os
+import torch
+
+def save_attention_map(attn_weights, step, layer_idx, base_dir="attn_maps/"):
+    step_dir = os.path.join(base_dir, f"step_{step:03d}")
+    os.makedirs(step_dir, exist_ok=True)
+    
+    file_path = os.path.join(step_dir, f"layer_{layer_idx:02d}.pt")
+    
+    data_to_save = attn_weights.detach().cpu().half()
+    
+    if data_to_save.dim() == 4 and data_to_save.size(0) == 1:
+        data_to_save = data_to_save.squeeze(0)
+        
+    torch.save(data_to_save, file_path)
+
 @torch.compile()
 def scaled_dot_product_attention(q, k, v, mask=None, attn_mask=None, dropout_p=0.0, is_causal=False):
     return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
@@ -775,14 +791,37 @@ class LLaDABlock(nn.Module):
 
         # Get the attention scores.
         # shape: (B, nh, T, hs)
-        att = self._scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            dropout_p=0.0 if not self.training else self.config.attention_dropout,
-            is_causal=False,
-        )
+
+        # att = self._scaled_dot_product_attention(
+        #     q,
+        #     k,
+        #     v,
+        #     attn_mask=None,
+        #     dropout_p=0.0 if not self.training else self.config.attention_dropout,
+        #     is_causal=False,
+        # )
+        
+        # Manual attention calculation to save attention map
+        import math
+        # Calculate attention scores: (B, nh, T, T)
+        att_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
+        
+        if attention_bias is not None:
+            att_scores = att_scores + attention_bias
+            
+        attn_weights = torch.softmax(att_scores, dim=-1)
+        
+        # Save attention map
+        # Retrieve step from config (need to set model.config.current_step externally)
+        current_step = getattr(self.config, 'current_step', 0)
+        save_attention_map(attn_weights, current_step, self.layer_id)
+        
+        # Apply dropout if training
+        if self.training and self.config.attention_dropout > 0:
+            attn_weights = torch.nn.functional.dropout(attn_weights, p=self.config.attention_dropout)
+            
+        att = torch.matmul(attn_weights, v)
+
         # Re-assemble all head outputs side-by-side.
         att = att.transpose(1, 2).contiguous().view(B, T, C)
 
