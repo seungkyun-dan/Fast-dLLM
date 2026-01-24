@@ -112,7 +112,12 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
         i = 0
         while True:
-            model.config.current_step = nfe
+            # Update step in both configs (HF config and internal ModelConfig) to be safe
+            if hasattr(model, 'config'):
+                model.config.current_step = nfe
+            if hasattr(model, 'model') and hasattr(model.model, 'config'):
+                model.model.config.current_step = nfe
+                
             nfe += 1
             mask_index = (x == mask_id)
             logits = model(x).logits
@@ -162,7 +167,11 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
         block_mask_index = (x[:, current_block_start:current_block_end] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
 
-        model.config.current_step = nfe
+        if hasattr(model, 'config'):
+            model.config.current_step = nfe
+        if hasattr(model, 'model') and hasattr(model.model, 'config'):
+            model.model.config.current_step = nfe
+            
         output = model(x, use_cache=True)
         past_key_values = output.past_key_values
 
@@ -187,7 +196,12 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
         while True:
             if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
                 break
-            model.config.current_step = nfe
+            
+            if hasattr(model, 'config'):
+                model.config.current_step = nfe
+            if hasattr(model, 'model') and hasattr(model.model, 'config'):
+                model.model.config.current_step = nfe
+                
             nfe += 1
             mask_index = (x[:, current_block_start:] == mask_id)
             mask_index[:, block_length:] = 0
@@ -238,6 +252,11 @@ def generate_with_dual_cache(
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)  # (B, steps_per_block)
 
         # 1) Warm KV-cache on the full prefix once per block
+        if hasattr(model, 'config'):
+             model.config.current_step = nfe
+        if hasattr(model, 'model') and hasattr(model.model, 'config'):
+             model.model.config.current_step = nfe
+             
         out_full = model(x, use_cache=True)
         past_key_values = out_full.past_key_values
         nfe += 1
@@ -270,6 +289,12 @@ def generate_with_dual_cache(
             # Evaluate logits only for current block with cache
             if (x[:, s:e] == mask_id).sum() == 0:
                 break
+            
+            if hasattr(model, 'config'):
+                model.config.current_step = nfe
+            if hasattr(model, 'model') and hasattr(model.model, 'config'):
+                model.model.config.current_step = nfe
+
             logits_blk = model(
                 x[:, s:e], past_key_values=past_key_values, use_cache=True, replace_position=replace_position
             ).logits  # shape expected by get_transfer_index*

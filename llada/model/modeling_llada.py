@@ -813,7 +813,10 @@ class LLaDABlock(nn.Module):
         
         # Save attention map
         # Retrieve step from config (need to set model.config.current_step externally)
+        # Check both config and self.config for 'current_step', default to 0
         current_step = getattr(self.config, 'current_step', 0)
+        
+        # print(f"Saving attention map for step {current_step}, layer {self.layer_id}") # Debug print
         save_attention_map(attn_weights, current_step, self.layer_id)
         
         # Apply dropout if training
