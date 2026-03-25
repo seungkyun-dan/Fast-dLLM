@@ -116,6 +116,7 @@ def sample_tokens(logits, temperature=0.0, top_p=None, top_k=None, margin_confid
 class DreamModelOutput(ModelOutput):
     sequences: torch.LongTensor = None
     history: Optional[Tuple[torch.FloatTensor]] = None
+    nfe: int = 0
 
 
 class DreamGenerationConfig(GenerationConfig):
@@ -373,14 +374,15 @@ class DreamGenerationMixin:
         threshold = kwargs.get("threshold", 0.9)
         block_length = kwargs.get("block_length", 32)
         dual_cache = kwargs.get("dual_cache", False)
-
+        use_cache = kwargs.get("use_cache", True)
         result = self._sample(
             input_ids,
             attention_mask=attention_mask,
             generation_config=generation_config,
             threshold=threshold,
             block_length=block_length,
-            dual_cache=dual_cache
+            dual_cache=dual_cache,
+            use_cache=use_cache
         )
         return result
 
@@ -392,6 +394,7 @@ class DreamGenerationMixin:
         threshold: Optional[float] = 0.9,
         block_length: Optional[int] = 32,
         dual_cache: bool = False,
+        use_cache: bool = True,
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         # init values
         
@@ -440,6 +443,7 @@ class DreamGenerationMixin:
 
         # Initialize cache for the prompt
         past_key_values = None
+        nfe = 0
 
         # Process each block
         for num_block in range(num_blocks):
@@ -448,56 +452,86 @@ class DreamGenerationMixin:
             current_block_end = current_block_start + block_length
 
             # update cache
-            model_output = self(x, attention_mask, tok_idx, use_cache=True)
-            past_key_values = model_output.past_key_values
-            logits = model_output.logits
+            if use_cache:
+                model_output = self(x, attention_mask, tok_idx, use_cache=True)
+                past_key_values = model_output.past_key_values
+                logits = model_output.logits
+            else:
+                model_output = self(x, attention_mask, tok_idx, use_cache=False)
+                logits = model_output.logits
+            nfe += 1
+                past_key_values = None
+
             logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
             confidence, x0 = sample_tokens(logits, temperature=temperature, top_p=top_p, top_k=top_k)
             x[:, current_block_start] = x0[:, current_block_start]
             
             # Extract only previous block cache
-            if not dual_cache:
-                new_past_key_values = []
-                for i in range(len(past_key_values)):
-                    new_past_key_values.append(())
-                    for j in range(len(past_key_values[i])):
-                        new_past_key_values[i] += (past_key_values[i][j][:, :current_block_start, :],)
-                past_key_values = new_past_key_values
-            else:
-                replace_position = torch.zeros_like(x, dtype=torch.bool)
-                replace_position[:, current_block_start:current_block_end] = 1
+            if use_cache:
+                if not dual_cache:
+                    new_past_key_values = []
+                    for i in range(len(past_key_values)):
+                        new_past_key_values.append(())
+                        for j in range(len(past_key_values[i])):
+                            new_past_key_values[i] += (past_key_values[i][j][:, :current_block_start, :],)
+                    past_key_values = new_past_key_values
+                else:
+                    replace_position = torch.zeros_like(x, dtype=torch.bool)
+                    replace_position[:, current_block_start:current_block_end] = 1
                 
             i = 1
             while True:
                 # Use cache for generation
-                if dual_cache:
+                if use_cache:
+                    if dual_cache:
+                        # print("Using dual cache generation")
+                        # print(f"Current block: {current_block_start-current_block_end}")
+                        mask_index = (x[:, current_block_start:current_block_end] == mask_token_id)
+                    else:
+                        # print("Using prefix cache generation")
+                        # print(f"Current block: {current_block_start-current_block_end}")
+                        mask_index = (x[:, current_block_start:] == mask_token_id)
+                    
+                    # Prepare attention mask for cached generation
+                    if attention_mask != "full":
+                        # Adjust attention mask for current position
+                        # Need to slice both query (dim 2) and key (dim 3) dimensions
+                        if dual_cache:
+                            # For dual_cache, query range is current_block_start:current_block_end
+                            current_attention_mask = attention_mask[:, :, current_block_start:current_block_end, :]
+                        else:
+                            # For prefix_cache, query range is current_block_start:
+                            current_attention_mask = attention_mask[:, :, current_block_start:, :]
+                    else:
+                        current_attention_mask = attention_mask
+                    
+                    if dual_cache:
+                        model_output = self(x[:, current_block_start:current_block_end], current_attention_mask, 
+                                        tok_idx[:, current_block_start:current_block_end] if tok_idx is not None else None, 
+                                        past_key_values=past_key_values, use_cache=True, dual_cache=dual_cache, replace_position=replace_position)
+                    else:
+                        model_output = self(x[:, current_block_start:], current_attention_mask, 
+                                        tok_idx[:, current_block_start:] if tok_idx is not None else None, 
+                                        past_key_values=past_key_values, use_cache=True)
+                    logits = model_output.logits
+                else:
                     mask_index = (x[:, current_block_start:current_block_end] == mask_token_id)
-                else:
-                    mask_index = (x[:, current_block_start:] == mask_token_id)
-                
-                # Prepare attention mask for cached generation
-                if attention_mask != "full":
-                    # Adjust attention mask for current position
-                    current_attention_mask = attention_mask[:, :, :, current_block_start:]
-                else:
-                    current_attention_mask = attention_mask
-                
-                if dual_cache:
-                    model_output = self(x[:, current_block_start:current_block_end], current_attention_mask, 
-                                    tok_idx[:, current_block_start:current_block_end] if tok_idx is not None else None, 
-                                    past_key_values=past_key_values, use_cache=True, dual_cache=dual_cache, replace_position=replace_position)
-                else:
-                    model_output = self(x[:, current_block_start:], current_attention_mask, 
-                                    tok_idx[:, current_block_start:] if tok_idx is not None else None, 
-                                    past_key_values=past_key_values, use_cache=True)
-                logits = model_output.logits
+                    model_output = self(x, attention_mask, tok_idx, use_cache=False)
+                    logits = model_output.logits
+                nfe += 1
+
                 logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
                 if alg == 'confidence_threshold':
-                    mask_logits = logits[mask_index]
+                    if use_cache:
+                        mask_logits = logits[mask_index]
+                    else:
+                        print(logits.shape, mask_index.shape)
+                        mask_logits = logits[:, current_block_start:current_block_end][mask_index]
+                        print(f"mask_logits shape: {mask_logits.shape}")
                 
                     confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
                     
-                    if dual_cache:
+                    if dual_cache or not use_cache:
                         x_ = torch.zeros_like(x[:, current_block_start:current_block_end], device=self.device, dtype=torch.long) + mask_token_id
                         full_confidence = torch.full_like(x[:, current_block_start:current_block_end], -torch.inf, device=self.device, dtype=logits.dtype)
                     else:
@@ -518,7 +552,7 @@ class DreamGenerationMixin:
                     for k in range(1, current_transfer_tokens):
                         if selected_confidence[0, k] < threshold:
                             transfer_index[0, select_index[0, k]] = False
-                    if dual_cache:
+                    if dual_cache or not use_cache:
                         x[:, current_block_start:current_block_end][transfer_index] = x_[transfer_index]
                     else:
                         x[:, current_block_start:][transfer_index] = x_[transfer_index]
@@ -527,12 +561,21 @@ class DreamGenerationMixin:
                         break
                     t = timesteps[i]
                     s = timesteps[i + 1]
-                    mask_index[:, block_length:] = False
-                    mask_logits = logits[mask_index]
+                    if use_cache:
+                        mask_index[:, block_length:] = False
+                        mask_logits = logits[mask_index]
+                        # print(f"mask_logits shape: {mask_logits.shape}")
+                    else:
+                        # No Cache일 때 mask_index는 현재 블록 크기만큼임
+                        mask_index[:, block_length:] = False # 이미 블록 크기이므로 필요 없음?
+                        # mask_index는 (B, block_length) 크기임.
+                        # logits는 (B, L, V) 크기임.
+                        mask_logits = logits[:, current_block_start:current_block_end][mask_index]
+                        # print(f"mask_logits shape: {mask_logits.shape}")
                     confidence, x0 = sample_tokens(mask_logits, temperature, top_p=top_p, top_k=top_k, neg_entropy=True)
                     num_mask_token = mask_index.sum() / mask_index.shape[0]
                     number_transfer_tokens = int(num_mask_token * (1 - s / t)) if i < steps_per_block - 1 else int(num_mask_token)
-                    if dual_cache:
+                    if dual_cache or not use_cache:
                         full_confidence = torch.full_like(x[:, current_block_start:current_block_end], -torch.inf, device=self.device, dtype=logits.dtype)
                     else:
                         full_confidence = torch.full_like(x[:, current_block_start:], -torch.inf, device=self.device, dtype=logits.dtype)
@@ -546,13 +589,13 @@ class DreamGenerationMixin:
                             full_confidence = full_confidence / alg_temp
                             full_confidence = F.softmax(full_confidence, dim=-1)
                             transfer_index = torch.multinomial(full_confidence, num_samples=number_transfer_tokens)
-                        if dual_cache:
+                        if dual_cache or not use_cache:
                             x_ = torch.zeros_like(x[:, current_block_start:current_block_end], device=self.device, dtype=torch.long) + mask_token_id
                         else:
                             x_ = torch.zeros_like(x[:, current_block_start:], device=self.device, dtype=torch.long) + mask_token_id
                         x_[mask_index] = x0.clone()
                         row_indices = torch.arange(x.size(0), device=self.device).unsqueeze(1).expand_as(transfer_index)
-                        if dual_cache:
+                        if dual_cache or not use_cache:
                             x[:, current_block_start:current_block_end][row_indices,transfer_index] = x_[row_indices,transfer_index]
                         else:
                             x[:, current_block_start:][row_indices,transfer_index] = x_[row_indices,transfer_index]
@@ -566,6 +609,7 @@ class DreamGenerationMixin:
             return DreamModelOutput(
                 sequences=x,
                 history=histories,
+                nfe=nfe,
             )
         else:
             return x

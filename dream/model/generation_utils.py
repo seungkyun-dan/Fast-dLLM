@@ -98,6 +98,7 @@ def sample_tokens(logits, temperature=0.0, top_p=None, top_k=None, margin_confid
 class DreamModelOutput(ModelOutput):
     sequences: torch.LongTensor = None
     history: Optional[Tuple[torch.FloatTensor]] = None
+    nfe: int = 0
 
 
 class DreamGenerationConfig(GenerationConfig):
@@ -412,6 +413,7 @@ class DreamGenerationMixin:
 
         # this allows user-defined token control of the intermediate steps
         x = generation_tokens_hook_func(None, x, None)
+        nfe = 0
         i = 0
         if alg == 'confidence_threshold':
             mask_index = (x == mask_token_id)
@@ -423,6 +425,7 @@ class DreamGenerationMixin:
         while i < steps:
             mask_index = (x == mask_token_id)
             logits = self(x, attention_mask, tok_idx).logits
+            nfe += 1
             logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
 
             # this allows user-defined logits control of the intermediate steps
@@ -496,13 +499,14 @@ class DreamGenerationMixin:
                 histories.append(x.clone())
             i += 1
         
-        print(f'used steps: {steps}')
+        print(f'used steps: {steps}, nfe: {nfe}')
         end_time = time.time()
         print(f'used time: {end_time - start_time}')
         if return_dict_in_generate:
             return DreamModelOutput(
                 sequences=x,
                 history=histories,
+                nfe=nfe,
             )
         else:
             return x

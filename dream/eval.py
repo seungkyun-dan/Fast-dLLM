@@ -211,6 +211,7 @@ class Dream(LM):
         self.dual_cache = dual_cache
         self.generated_token_num = 0
         self.save_dir = save_dir
+        self.total_nfe = 0
     @property
     def batch_size(self):
         return self.batch_size_per_gpu
@@ -319,11 +320,13 @@ class Dream(LM):
             alg_temp=self.alg_temp,
             threshold=self.threshold,
             dual_cache=self.dual_cache,
+            use_cache=self.use_cache,
         )
 
         # decode
         self.generated_token_num += (generation_ids.sequences[0][prompt_ids.shape[1] :] != self.tokenizer.eos_token_id).sum().item()
-        print(f"generated_token_num: {self.generated_token_num}")
+        self.total_nfe += getattr(generation_ids, 'nfe', 0)
+        print(f"generated_token_num: {self.generated_token_num}, nfe: {self.total_nfe}")
         responses = [
             self.tokenizer.decode(g[len(p) :].tolist()).split(self.tokenizer.eos_token)[0]
             for p, g in zip(prompt_ids, generation_ids.sequences)
@@ -341,7 +344,7 @@ class Dream(LM):
             self.model.diffusion_generate = types.MethodType(DreamGenerationMixin.diffusion_generate, self.model)
             self.model._sample = types.MethodType(DreamGenerationMixin._sample, self.model)
         else:
-            from model.generation_utils import DreamGenerationMixin
+            from model.generation_utils_block import DreamGenerationMixin
             self.model.diffusion_generate = types.MethodType(DreamGenerationMixin.diffusion_generate, self.model)
             self.model._sample = types.MethodType(DreamGenerationMixin._sample, self.model)
 
@@ -395,7 +398,7 @@ class Dream(LM):
         print(f"Time taken: {end_time - start_time} seconds")
         print(f"Generated token num: {self.generated_token_num}")
         print(f"Generated token num per second: {self.generated_token_num / (end_time - start_time)}")
-
+        print(f"Total NFE: {self.total_nfe}")
         return res
 
     def _forward_process(self, batch):
